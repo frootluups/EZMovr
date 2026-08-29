@@ -24,7 +24,7 @@ class OnboardingWindow(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
 
-        self.title("Welcome to SD Card Photo Mover")
+        self.title("Welcome to EZMovr")
         self.geometry("560x560")
         self.resizable(False, False)
         self.protocol("WM_DELETE_WINDOW", self._on_close)

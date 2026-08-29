@@ -1,4 +1,4 @@
-"""CustomTkinter GUI for the SD Card Photo Mover."""
+"""CustomTkinter GUI for the EZMovr."""
 
 import threading
 import customtkinter as ctk
@@ -112,7 +112,7 @@ class SDMoverApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("SD Card Photo Mover")
+        self.title("EZMovr")
         self.geometry("1050x700")
         self.minsize(900, 600)
 
@@ -136,7 +136,7 @@ class SDMoverApp(ctk.CTk):
         header.pack(fill="x", padx=20, pady=(14, 6))
 
         ctk.CTkLabel(
-            header, text="SD Card Photo Mover",
+            header, text="EZMovr",
             font=("", 20, "bold"),
         ).pack(side="left")
 

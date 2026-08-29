@@ -1,6 +1,6 @@
 @echo off
 echo ======================================
-echo   Building SD Card Photo Mover...
+echo   Building EZMovr...
 echo ======================================
 
 pip install pyinstaller --quiet
@@ -9,6 +9,6 @@ pyinstaller SDCardMover.spec --clean --noconfirm
 echo.
 echo ======================================
 echo   Build complete!
-echo   Executable: dist\SD Card Photo Mover.exe
+echo   Executable: dist\EZMovr.exe
 echo ======================================
 pause

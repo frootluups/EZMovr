@@ -1,4 +1,4 @@
-"""Entry point for SD Card Photo Mover."""
+"""Entry point for EZMovr."""
 
 import sys
 from pathlib import Path
