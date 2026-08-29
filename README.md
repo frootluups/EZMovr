@@ -37,6 +37,18 @@ to the trusted roots, and signs the executable. **Do not distribute** — the
 cert is only trusted on this PC. For real distribution you'd need a proper CA
 code-signing certificate.
 
+### Build one-click installer
+Requires [Inno Setup 7](https://jrsoftware.org/isinfo.php). Build the exe first,
+then:
+
+```bash
+build.bat
+installer\build_installer.bat
+```
+
+Output: `installer\Output\EZMovr-setup.exe` (installs to Program Files, creates
+Start Menu/desktop shortcuts, removable via Add/Remove Programs).
+
 ## Windows Smart App Control / SmartScreen troubleshooting
 
 The executable is unsigned and built with PyInstaller, which some Windows

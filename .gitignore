@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 *.spec
+installer/Output/
 
 # Settings (user-specific)
 settings.json
