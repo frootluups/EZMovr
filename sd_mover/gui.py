@@ -1,6 +1,9 @@
 """CustomTkinter GUI for the EZMovr."""
 
+import os
+import queue
 import threading
+import time
 import customtkinter as ctk
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -8,11 +11,18 @@ from tkinter import filedialog, messagebox
 from PIL import Image
 
 from .drive_detector import get_removable_drives, format_drive_info
-from .file_scanner import scan_drive, filter_new_files, get_files_summary, is_image
+from .file_scanner import (
+    scan_drive,
+    filter_new_files,
+    get_files_summary,
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    RAW_EXTENSIONS,
+)
 from .folder_builder import get_destination, ensure_folder
 from .file_copier import copy_files
 from . import settings
-from .theme_detector import apply_theme, get_windows_theme
+from .theme_detector import apply_theme
 from .onboarding import OnboardingWindow
 
 ACCENT = "#3B82F6"
@@ -26,85 +36,237 @@ COLS = 3
 
 
 class PhotoPreviewPanel(ctk.CTkScrollableFrame):
-    """Scrollable grid of photo thumbnails."""
+    """Scrollable grid of photo thumbnails, rendered asynchronously.
+
+    Files are grouped into sections: RAW, Portrait, Landscape, and Video.
+    Thumbnail decoding happens on a worker thread and the UI is updated a few
+    widgets at a time so the app never freezes, even with thousands of files.
+    """
+
+    CHUNK = 24          # widgets rendered per UI tick
+    BATCH = 12          # items queued per worker loop
+    POLL_MS = 40        # UI pump interval
+
+    SECTION_ORDER = ["raw", "portrait", "landscape", "video"]
+    SECTION_LABELS = {
+        "raw": "RAW",
+        "portrait": "Portrait",
+        "landscape": "Landscape",
+        "video": "Video",
+    }
 
     def __init__(self, master, **kwargs):
         super().__init__(master, label_text="Preview", **kwargs)
-        self._thumbs = []  # prevent GC
+        self._thumbs = []  # keep CTkImage refs alive (prevent GC)
+        self._queue = queue.Queue()
+        self._gen_id = 0
+        self._rendered = 0
+        self._total = 0
+        self._loading_label = None
+        self._current_section = None
+        self._row_frames = []
+        self._row_count = 0
+
+    # ---- public API ----
 
     def clear(self):
+        self._gen_id += 1
+        with self._queue.mutex:
+            self._queue.queue.clear()
         for w in self.winfo_children():
             w.destroy()
         self._thumbs.clear()
+        self._row_frames.clear()
+        self._current_section = None
+        self._row_count = 0
+        self._rendered = 0
+        self._loading_label = None
 
     def load_files(self, files):
         self.clear()
+        self._total = len(files)
         if not files:
             ctk.CTkLabel(self, text="No previews available", text_color="gray50").pack(pady=30)
             return
 
-        row_frame = None
-        for i, f in enumerate(files):
-            if i % COLS == 0:
-                row_frame = ctk.CTkFrame(self, fg_color="transparent")
-                row_frame.pack(fill="x", pady=THUMB_PAD)
+        self._loading_label = ctk.CTkLabel(
+            self,
+            text=f"Loading previews... 0/{len(files)}",
+            font=("", 11), text_color="gray55",
+        )
+        self._loading_label.pack(pady=6)
 
-            cell = ctk.CTkFrame(row_frame, fg_color="transparent")
-            cell.pack(side="left", padx=THUMB_PAD)
+        gen = self._gen_id
+        threading.Thread(target=self._worker, args=(gen, files), daemon=True).start()
+        self.after(self.POLL_MS, self._pump, gen)
 
-            if is_image(f):
-                self._load_thumbnail(cell, f)
-            else:
-                self._load_video_icon(cell, f)
+    # ---- background work ----
 
-    def _load_thumbnail(self, parent, path):
+    def _worker(self, gen, files):
+        if self._gen_id != gen:
+            return
+
+        # Group files into category buckets so sections render contiguously.
+        buckets = {cat: [] for cat in self.SECTION_ORDER}
+        for f in files:
+            if self._gen_id != gen:
+                return
+            cat = self._categorize(f)
+            buckets.setdefault(cat, []).append(f)
+
+        batch = []
+        for cat in self.SECTION_ORDER:
+            for f in buckets.get(cat, []):
+                if self._gen_id != gen:
+                    return
+                kind, pil = self._classify(f)
+                batch.append((cat, f.name, kind, pil))
+                if len(batch) >= self.BATCH:
+                    self._queue.put(batch)
+                    batch = []
+                    time.sleep(0.005)  # let the UI pump keep pace
+        if batch:
+            self._queue.put(batch)
+
+    def _categorize(self, path):
+        """Return the section a file belongs to."""
+        ext = path.suffix.lower()
+        if ext in VIDEO_EXTENSIONS:
+            return "video"
+        if ext in RAW_EXTENSIONS:
+            return "raw"
+        if ext in IMAGE_EXTENSIONS:
+            w, h = self._image_size(path)
+            return "portrait" if h > w else "landscape"
+        return "landscape"
+
+    def _image_size(self, path):
+        """Read image dimensions from the header without full decode."""
+        try:
+            with Image.open(path) as img:
+                return img.size
+        except Exception:
+            return (1, 1)
+
+    def _classify(self, path):
+        ext = path.suffix.lower()
+        if ext in VIDEO_EXTENSIONS:
+            return "video", None
+        if ext in RAW_EXTENSIONS:
+            pil = self._load_raw_pil(path)
+            return ("img", pil) if pil is not None else ("raw", None)
+        if ext in IMAGE_EXTENSIONS:
+            pil = self._load_pil(path)
+            return ("img", pil) if pil is not None else ("fail", None)
+        return "other", None
+
+    def _load_pil(self, path):
+        img = None
         try:
             img = Image.open(path)
+            img.draft("RGB", THUMB_SIZE)  # fast JPEG decode header preview
             img.thumbnail(THUMB_SIZE, Image.LANCZOS)
-            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+            img = img.convert("RGB")
+            out = img.copy()
+            return out
+        except Exception:
+            return None
+        finally:
+            if img is not None:
+                img.close()
 
-            card = ctk.CTkFrame(parent, fg_color=("gray88", "#252525"), corner_radius=6)
-            card.pack()
+    def _load_raw_pil(self, path):
+        """Render a RAW preview via rawpy (CR2, NEF, ARW, DNG, etc.)."""
+        try:
+            import rawpy
+            with rawpy.imread(str(path)) as raw:
+                rgb = raw.postprocess(use_camera_wb=True, half_size=True)
+            img = Image.fromarray(rgb)
+            img.thumbnail(THUMB_SIZE, Image.LANCZOS)
+            return img.convert("RGB")
+        except Exception:
+            return None
 
+    # ---- UI-side rendering ----
+
+    def _pump(self, gen):
+        if gen != self._gen_id:
+            return
+        rendered = 0
+        while rendered < self.CHUNK:
+            try:
+                items = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            for category, name, kind, pil in items:
+                self._add_thumb(category, name, kind, pil)
+                rendered += 1
+        self._rendered += rendered
+
+        if self._loading_label is not None:
+            self._loading_label.configure(
+                text=f"Loading previews... {self._rendered}/{self._total}"
+            )
+            if self._rendered >= self._total:
+                self._loading_label.destroy()
+                self._loading_label = None
+            else:
+                self.after(self.POLL_MS, self._pump, gen)
+
+    def _start_section(self, category):
+        self._row_frames.clear()
+        self._row_count = 0
+        ctk.CTkLabel(
+            self,
+            text=self.SECTION_LABELS.get(category, category.title()),
+            font=("", 13, "bold"),
+            text_color=("gray15", "gray85"),
+            anchor="w",
+        ).pack(fill="x", padx=2, pady=(10, 2))
+
+    def _add_thumb(self, category, name, kind, pil):
+        if category != self._current_section:
+            self._current_section = category
+            self._start_section(category)
+
+        col = self._row_count % COLS
+        if col == 0:
+            row = ctk.CTkFrame(self, fg_color="transparent")
+            row.pack(fill="x", pady=THUMB_PAD)
+            self._row_frames.append(row)
+        parent = self._row_frames[-1]
+
+        cell = ctk.CTkFrame(parent, fg_color="transparent")
+        cell.pack(side="left", padx=THUMB_PAD)
+        self._row_count += 1
+
+        card = ctk.CTkFrame(cell, fg_color=("gray88", "#252525"), corner_radius=6)
+        card.pack()
+
+        if kind == "img":
+            ctk_img = ctk.CTkImage(
+                light_image=pil, dark_image=pil, size=(pil.width, pil.height)
+            )
             lbl = ctk.CTkLabel(card, image=ctk_img, text="")
             lbl.image = ctk_img  # prevent GC
             lbl.pack(padx=4, pady=(4, 0))
-
-            name = path.name if len(path.name) < 18 else path.name[:15] + "..."
-            ctk.CTkLabel(card, text=name, font=("Consolas", 9), text_color="gray70").pack(
-                padx=4, pady=(0, 4),
-            )
             self._thumbs.append(ctk_img)
-        except Exception:
-            self._load_placeholder(parent, path, "Cannot preview")
+        else:
+            label = {
+                "video": "Video",
+                "raw": "RAW",
+                "fail": "Cannot preview",
+                "other": "File",
+            }.get(kind, "File")
+            ctk.CTkLabel(
+                card, text=label, font=("", 12, "bold"),
+                width=THUMB_SIZE[0], height=THUMB_SIZE[1],
+                fg_color=("gray75", "#333"), corner_radius=4,
+                text_color=("gray30", "gray75"),
+            ).pack(padx=4, pady=(4, 0))
 
-    def _load_video_icon(self, parent, path):
-        card = ctk.CTkFrame(parent, fg_color=("gray88", "#252525"), corner_radius=6)
-        card.pack()
-
-        ctk.CTkLabel(
-            card, text="Video", font=("", 16, "bold"),
-            width=THUMB_SIZE[0], height=THUMB_SIZE[1],
-            fg_color=("gray75", "#333"), corner_radius=4,
-        ).pack(padx=4, pady=(4, 0))
-
-        name = path.name if len(path.name) < 18 else path.name[:15] + "..."
-        ctk.CTkLabel(card, text=name, font=("Consolas", 9), text_color="gray70").pack(
-            padx=4, pady=(0, 4),
-        )
-
-    def _load_placeholder(self, parent, path, label):
-        card = ctk.CTkFrame(parent, fg_color=("gray88", "#252525"), corner_radius=6)
-        card.pack()
-
-        ctk.CTkLabel(
-            card, text=label, font=("", 11),
-            width=THUMB_SIZE[0], height=THUMB_SIZE[1],
-            fg_color=("gray75", "#333"), corner_radius=4,
-        ).pack(padx=4, pady=(4, 0))
-
-        name = path.name if len(path.name) < 18 else path.name[:15] + "..."
-        ctk.CTkLabel(card, text=name, font=("Consolas", 9), text_color="gray70").pack(
+        short = name if len(name) < 18 else name[:15] + "..."
+        ctk.CTkLabel(card, text=short, font=("Consolas", 9), text_color="gray70").pack(
             padx=4, pady=(0, 4),
         )
 
@@ -119,6 +281,11 @@ class SDMoverApp(ctk.CTk):
 
         ctk.set_default_color_theme("blue")
 
+        # Match the root background to the theme colors so maximized/resized
+        # areas repaint instantly instead of flashing black.
+        self.configure(fg_color=("#ebebeb", "#242424"))
+        self.bind("<Configure>", self._on_window_resize)
+
         self.drives = []
         self.selected_drive = None
         self.scanned_files = []
@@ -126,9 +293,29 @@ class SDMoverApp(ctk.CTk):
 
         self._build_ui()
         self._load_saved_settings()
+        self._center_window()
         self._scan_drives()
 
         self.after(100, self._check_onboarding)
+
+    def _center_window(self):
+        """Center the window on screen."""
+        self.update_idletasks()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = max((sw - w) // 2, 0)
+        y = max((sh - h) // 2, 0)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _on_window_resize(self, event):
+        """Repaint immediately after resize/maximize to avoid black gaps."""
+        if event.widget is self:
+            self.after_idle(self._repaint)
+
+    def _repaint(self):
+        self.update_idletasks()
 
     def _build_ui(self):
         # --- Header ---
@@ -416,8 +603,14 @@ class SDMoverApp(ctk.CTk):
 
         threading.Thread(target=self._scan_thread, args=(drive_path,), daemon=True).start()
 
+    def _scan_progress(self, count):
+        self.scan_status.configure(text=f"Scanning... {count} files found")
+
     def _scan_thread(self, drive_path):
-        files = scan_drive(drive_path)
+        def on_progress(count):
+            self.after(0, self._scan_progress, count)
+
+        files = scan_drive(drive_path, progress_cb=on_progress)
 
         if self.mode_var.get() == "new":
             dest = get_destination(
@@ -526,7 +719,19 @@ class SDMoverApp(ctk.CTk):
                 settings.save_settings(onboarding.result)
                 self.base_folder_var.set(onboarding.result["base_folder"])
 
+            # Smooth transition: fade in main window
             self.deiconify()
+            self.attributes("-alpha", 0.0)
+            self._fade_in()
+
+    def _fade_in(self, alpha=0.0):
+        """Gradually increase window opacity for smooth transition."""
+        if alpha < 1.0:
+            alpha += 0.08
+            self.attributes("-alpha", min(alpha, 1.0))
+            self.after(20, self._fade_in, alpha)
+        else:
+            self.attributes("-alpha", 1.0)
 
     def _load_saved_settings(self):
         saved = settings.load_settings()

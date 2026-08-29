@@ -1,8 +1,9 @@
 """Scan SD card for media files and handle deduplication."""
 
 import hashlib
+import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 SUPPORTED_EXTENSIONS = {
     # Images
@@ -37,26 +38,58 @@ def is_image(path: Path) -> bool:
     return path.suffix.lower() in IMAGE_EXTENSIONS
 
 
-def scan_drive(drive_path: str) -> List[Path]:
-    """Recursively scan a drive for all supported media files.
+def _walk_media(root: str, progress_cb: Optional[Callable[[int], None]], throttle: int) -> List[str]:
+    """Iterative os.scandir walk returning paths of supported media files.
 
-    Returns sorted list of file paths.
+    Much faster than Path.rglob: avoids per-entry Path object construction
+    and only stats files, with follow_symlinks disabled for speed/safety.
     """
-    root = Path(drive_path)
     files = []
-    if not root.exists():
-        return files
-
-    for f in root.rglob("*"):
-        if f.is_file() and is_media_file(f):
-            files.append(f)
-
-    files.sort(key=lambda p: p.name)
+    stack = [root]
+    count = 0
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            ext = os.path.splitext(entry.name)[1].lower()
+                            if ext in SUPPORTED_EXTENSIONS:
+                                files.append(entry.path)
+                                count += 1
+                                if progress_cb and count % throttle == 0:
+                                    progress_cb(count)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
     return files
 
 
-def compute_file_hash(path: Path, chunk_size: int = 8192) -> str:
-    """Compute SHA-256 hash of a file."""
+def scan_drive(
+    drive_path: str,
+    progress_cb: Optional[Callable[[int], None]] = None,
+    throttle: int = 200,
+) -> List[Path]:
+    """Recursively scan a drive for all supported media files.
+
+    Returns a sorted list of file paths. progress_cb is called periodically
+    with the running file count so the UI can stay responsive on long scans.
+    """
+    root = str(drive_path)
+    if not os.path.isdir(root):
+        return []
+
+    raw = _walk_media(root, progress_cb, throttle)
+    raw.sort(key=lambda p: os.path.basename(p).lower())
+    return [Path(p) for p in raw]
+
+
+def compute_file_hash(path: Path, chunk_size: int = 1 << 16) -> str:
+    """Compute SHA-256 hash of a file using a 64KB buffer."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while True:
@@ -67,20 +100,32 @@ def compute_file_hash(path: Path, chunk_size: int = 8192) -> str:
     return h.hexdigest()
 
 
-def build_destination_hashes(dest_dir: Path) -> dict:
-    """Build a dict of {hash: Path} for all media files in destination directory."""
-    hashes = {}
-    if not dest_dir.exists():
-        return hashes
+def _index_destination(dest_dir: Path) -> dict:
+    """Build {(file_name, file_size): [dest_path_str]} for media files.
 
-    for f in dest_dir.rglob("*"):
-        if f.is_file() and is_media_file(f):
-            try:
-                h = compute_file_hash(f)
-                hashes[h] = f
-            except (PermissionError, OSError):
-                continue
-    return hashes
+    Uses a cheap file name + size key instead of hashing, so we only hash
+    files that could actually be duplicates (identical name *and* size).
+    """
+    index = {}
+    stack = [str(dest_dir)]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            ext = os.path.splitext(entry.name)[1].lower()
+                            if ext in SUPPORTED_EXTENSIONS:
+                                size = entry.stat().st_size
+                                index.setdefault((entry.name, size), []).append(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return index
 
 
 def filter_new_files(
@@ -88,22 +133,44 @@ def filter_new_files(
 ) -> Tuple[List[Path], int]:
     """Filter source files to only those not already in dest_dir.
 
+    Fast path: files whose (name, size) don't exist in the destination are
+    new with no hashing. Only exact name+size collisions are hashed to fully
+    verify duplication.
+
     Returns (new_files, duplicate_count).
     """
-    existing_hashes = build_destination_hashes(dest_dir)
-    if not existing_hashes:
+    dest = Path(dest_dir)
+    if not dest.exists():
+        return source_files, 0
+
+    index = _index_destination(dest)
+    if not index:
         return source_files, 0
 
     new_files = []
     dupes = 0
     for src in source_files:
         try:
-            src_hash = compute_file_hash(src)
-            if src_hash not in existing_hashes:
+            st = src.stat()
+            candidates = index.get((src.name, st.st_size))
+            if not candidates:
                 new_files.append(src)
-            else:
+                continue
+
+            src_hash = compute_file_hash(src)
+            matched = False
+            for cand in candidates:
+                try:
+                    if compute_file_hash(Path(cand)) == src_hash:
+                        matched = True
+                        break
+                except OSError:
+                    continue
+            if matched:
                 dupes += 1
-        except (PermissionError, OSError):
+            else:
+                new_files.append(src)
+        except OSError:
             new_files.append(src)
 
     return new_files, dupes

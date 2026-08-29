@@ -25,7 +25,7 @@ class OnboardingWindow(ctk.CTkToplevel):
         super().__init__(parent)
 
         self.title("Welcome to EZMovr")
-        self.geometry("560x560")
+        self.geometry("560x680")
         self.resizable(False, False)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -35,11 +35,12 @@ class OnboardingWindow(ctk.CTkToplevel):
         self.result = None
 
         self._build_ui()
+        self._center_window()
 
     def _build_ui(self):
         # --- Icon / title area ---
         title_frame = ctk.CTkFrame(self, fg_color="transparent")
-        title_frame.pack(fill="x", pady=(30, 0))
+        title_frame.pack(fill="x", pady=(20, 0))
 
         ctk.CTkLabel(
             title_frame,
@@ -57,7 +58,7 @@ class OnboardingWindow(ctk.CTkToplevel):
 
         # --- How it works ---
         info = ctk.CTkFrame(self)
-        info.pack(fill="x", padx=30, pady=(20, 0))
+        info.pack(fill="x", padx=30, pady=(12, 0))
 
         ctk.CTkLabel(info, text="How it works", font=("", 14, "bold")).pack(
             anchor="w", padx=16, pady=(12, 0),
@@ -76,7 +77,7 @@ class OnboardingWindow(ctk.CTkToplevel):
 
         # --- Supported formats ---
         fmt = ctk.CTkFrame(self)
-        fmt.pack(fill="x", padx=30, pady=(12, 0))
+        fmt.pack(fill="x", padx=30, pady=(8, 0))
 
         ctk.CTkLabel(fmt, text="Supported formats", font=("", 14, "bold")).pack(
             anchor="w", padx=16, pady=(12, 0),
@@ -89,7 +90,7 @@ class OnboardingWindow(ctk.CTkToplevel):
 
         # --- Default folder ---
         folder = ctk.CTkFrame(self)
-        folder.pack(fill="x", padx=30, pady=(12, 0))
+        folder.pack(fill="x", padx=30, pady=(8, 0))
 
         ctk.CTkLabel(folder, text="Default save location", font=("", 14, "bold")).pack(
             anchor="w", padx=16, pady=(12, 0),
@@ -116,7 +117,7 @@ class OnboardingWindow(ctk.CTkToplevel):
 
         # --- Buttons ---
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=30, pady=(20, 24))
+        btn_frame.pack(fill="x", padx=30, pady=(14, 20))
 
         ctk.CTkButton(
             btn_frame,
@@ -141,6 +142,17 @@ class OnboardingWindow(ctk.CTkToplevel):
             hover_color=ACCENT_HOVER,
             command=self._on_start,
         ).pack(side="right")
+
+    def _center_window(self):
+        """Center the window on screen."""
+        self.update_idletasks()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = max((sw - w) // 2, 0)
+        y = max((sh - h) // 2, 0)
+        self.geometry(f"{w}x{h}+{x}+{y}")
 
     def _browse(self):
         folder = filedialog.askdirectory(title="Select default save folder")

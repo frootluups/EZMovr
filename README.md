@@ -25,6 +25,33 @@ build.bat
 ```
 Output: `dist\EZMovr.exe`
 
+### Build + sign locally (Smart App Control)
+Windows **Smart App Control** blocks unsigned executables like most Python-built apps. To make EZMovr trusted on *this* machine:
+
+```bash
+build.bat /sign
+```
+
+This creates a self-signed code-signing certificate in your user store, adds it
+to the trusted roots, and signs the executable. **Do not distribute** — the
+cert is only trusted on this PC. For real distribution you'd need a proper CA
+code-signing certificate.
+
+## Windows Smart App Control / SmartScreen troubleshooting
+
+The executable is unsigned and built with PyInstaller, which some Windows
+security heuristics flag. If Smart App Control or SmartScreen blocks it:
+
+1. **Build with `build.bat /sign`** (recommended, per-machine) — signing with a
+   cert trusted in your user store lets the app run without warnings.
+2. **"Windows protected your PC" prompt** → click **More info** → **Run anyway**.
+3. Make sure the exe isn't marked as "downloaded from the internet":
+   right-click the file → Properties → if **Unblock** is shown, click it.
+4. If Smart App Control is enabled and still blocks the file, copy the exe to a
+   new folder and run it once — a fresh copy avoids cached reputation.
+5. As a last resort you can turn off Smart App Control entirely:
+   Settings > Windows Security > App & browser control (not recommended).
+
 ## How it works
 
 1. Insert your camera's SD card
