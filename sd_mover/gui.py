@@ -12,6 +12,7 @@ from .file_scanner import scan_drive, filter_new_files, get_files_summary, is_im
 from .folder_builder import get_destination, ensure_folder
 from .file_copier import copy_files
 from . import settings
+from .theme_detector import apply_theme, get_windows_theme
 from .onboarding import OnboardingWindow
 
 ACCENT = "#3B82F6"
@@ -116,7 +117,6 @@ class SDMoverApp(ctk.CTk):
         self.geometry("1050x700")
         self.minsize(900, 600)
 
-        ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
         self.drives = []
@@ -145,6 +145,28 @@ class SDMoverApp(ctk.CTk):
             text="Transfer photos and videos from your camera to your PC.",
             font=("", 11), text_color="gray55",
         ).pack(side="left", padx=14)
+
+        # --- Theme toggle ---
+        theme_frame = ctk.CTkFrame(header, fg_color="transparent")
+        theme_frame.pack(side="right")
+
+        ctk.CTkLabel(
+            theme_frame, text="Theme:", font=("", 11), text_color="gray55",
+        ).pack(side="left", padx=(0, 4))
+
+        self.theme_var = ctk.StringVar(value="system")
+        self.theme_menu = ctk.CTkSegmentedButton(
+            theme_frame,
+            variable=self.theme_var,
+            values=["system", "light", "dark"],
+            selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER,
+            command=self._on_theme_change,
+            font=("", 11),
+            width=200,
+            height=30,
+        )
+        self.theme_menu.pack(side="left")
 
         # --- Two-column body ---
         body = ctk.CTkFrame(self, fg_color="transparent")
@@ -354,6 +376,10 @@ class SDMoverApp(ctk.CTk):
         if folder:
             self.base_folder_var.set(folder)
 
+    def _on_theme_change(self, choice):
+        apply_theme(choice)
+        settings.set("theme", choice)
+
     def _scan_drives(self):
         self.drives = get_removable_drives()
         if not self.drives:
@@ -508,3 +534,8 @@ class SDMoverApp(ctk.CTk):
         self.mode_var.set(saved.get("default_mode", "all"))
         self.dest_mode_var.set(saved.get("default_dest_mode", "date"))
         self._toggle_dest_name()
+
+        # Apply theme
+        theme = saved.get("theme", "system")
+        self.theme_var.set(theme)
+        apply_theme(theme)

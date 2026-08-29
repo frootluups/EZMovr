@@ -17,6 +17,7 @@ def load_settings() -> dict:
         "base_folder": str(Path.home() / "Pictures"),
         "default_mode": "all",
         "default_dest_mode": "date",
+        "theme": "system",
     }
 
     path = _get_settings_path()
