@@ -103,6 +103,9 @@ class LargePreviewWindow(ctk.CTkToplevel):
         self.bind("<Escape>", lambda e: self.destroy())
         self.bind("<Left>", lambda e: self._prev())
         self.bind("<Right>", lambda e: self._next())
+        self.bind("<Up>", lambda e: self._prev())
+        self.bind("<Down>", lambda e: self._next())
+        self.bind("<Key>", self._on_key)
         self.focus_set()
         try:
             self.grab_set()
@@ -212,6 +215,31 @@ class LargePreviewWindow(ctk.CTkToplevel):
             self.idx += 1
             self._show_current()
 
+    def _on_key(self, event):
+        # 1-5 rate, 0 clears
+        if event.char and event.char in "12345":
+            self._on_star(int(event.char))
+            return "break"
+        if (event.char and event.char == "0") or event.keysym in ("0", "KP_0"):
+            try:
+                path, _k = self.panel._preview_items[self.idx]
+                cur = self.panel.get_rating(path)
+                if cur != 0:
+                    self.panel.set_rating(path, cur)
+                    self._refresh_stars()
+            except Exception:
+                pass
+            return "break"
+        if event.keysym in ("Left", "Up"):
+            self._prev()
+            return "break"
+        if event.keysym in ("Right", "Down"):
+            self._next()
+            return "break"
+        if event.keysym == "Escape":
+            self._on_close()
+            return "break"
+
     def _show_current(self):
         items = getattr(self.panel, "_preview_items", [])
         if not items or not (0 <= self.idx < len(items)):
@@ -304,6 +332,9 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         self._sections = []  # [{cat, cards:[...], header:widget}]
         self._preview_items = []  # [(Path, kind)] in display order
         self._ratings = {}  # {str(Path): 0-5}
+        self._card_map = {}  # {str(Path): card}
+        self._large_cache = {}  # {str(Path): PIL}
+        self._large_cache_order = []
         self._viewer = None
         self._relayout_pending = False
         self._last_relayout_width = 0
@@ -365,9 +396,16 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
             pass
 
     def _load_large_preview(self, path):
+        key = str(path)
+        if key in self._large_cache:
+            try:
+                self._large_cache_order.remove(key)
+            except ValueError:
+                pass
+            self._large_cache_order.append(key)
+            return self._large_cache[key]
         ext = path.suffix.lower()
-        if ext in VIDEO_EXTENSIONS:
-            return None
+        out = None
         if ext in RAW_EXTENSIONS:
             try:
                 import rawpy
@@ -380,10 +418,12 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
                 elif orient in (5, 6, 7, 8):
                     img = img.rotate(270)
                 img.thumbnail(LARGE_PREVIEW_MAX, Image.BILINEAR)
-                return img.convert("RGB")
+                out = img.convert("RGB")
             except Exception:
                 return None
-        if ext in IMAGE_EXTENSIONS:
+        elif ext in VIDEO_EXTENSIONS:
+            return None
+        elif ext in IMAGE_EXTENSIONS:
             img = None
             try:
                 img = Image.open(path)
@@ -396,7 +436,6 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
                     img = ImageOps.exif_transpose(img)
                 img.thumbnail(LARGE_PREVIEW_MAX, Image.BILINEAR)
                 out = img.convert("RGB").copy()
-                return out
             except Exception:
                 return None
             finally:
@@ -405,7 +444,13 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
                         img.close()
                     except Exception:
                         pass
-        return None
+        if out is not None:
+            self._large_cache[key] = out
+            self._large_cache_order.append(key)
+            if len(self._large_cache_order) > 24:
+                oldest = self._large_cache_order.pop(0)
+                self._large_cache.pop(oldest, None)
+        return out
 
     def open_viewer(self, path):
         idx = 0
@@ -465,26 +510,24 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
     def set_rating(self, path, rating):
         key = str(path)
         cur = self._ratings.get(key, 0)
-        # clicking same star clears it
         if cur == rating:
             rating = 0
         if rating:
             self._ratings[key] = rating
         else:
             self._ratings.pop(key, None)
-        # update card stars
-        for sec in self._sections:
-            for card in sec["cards"]:
-                if str(getattr(card, "_path", "")) == key:
-                    stars = getattr(card, "_stars", None)
-                    if stars:
-                        for i, lbl in enumerate(stars):
-                            n = i + 1
-                            filled = n <= rating
-                            lbl.configure(text="★" if filled else "☆",
-                                          text_color="#FACC15" if filled else "gray60")
-                    break
-        # update large viewer if it shows this file
+        card = self._card_map.get(key)
+        if card is not None:
+            stars = getattr(card, "_stars", None)
+            if stars:
+                for i, lbl in enumerate(stars):
+                    n = i + 1
+                    filled = n <= rating
+                    try:
+                        lbl.configure(text="★" if filled else "☆",
+                                      text_color="#FACC15" if filled else "gray60")
+                    except Exception:
+                        pass
         if getattr(self, "_viewer", None) is not None:
             try:
                 if self._viewer.winfo_exists():
@@ -510,6 +553,9 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         self._sections = []
         self._preview_items = []
         self._ratings.clear()
+        self._card_map.clear()
+        self._large_cache.clear()
+        self._large_cache_order.clear()
         if getattr(self, "_viewer", None) is not None:
             try:
                 if self._viewer.winfo_exists():
@@ -855,6 +901,7 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         card.pack(in_=cell, padx=4, pady=(4, 0))
         self._sections[-1]["cards"].append(card)
         self._preview_items.append((path, kind))
+        self._card_map[str(path)] = card
         self._bind_card_click(card, path)
 
     def _on_star_click(self, path, rating):
@@ -989,6 +1036,32 @@ class SDMoverApp(ctk.CTk):
     def _repaint(self):
         self.update_idletasks()
 
+    def _scroll_preview(self, delta):
+        # Don't hijack when typing in an entry or when large viewer is open
+        try:
+            if getattr(self.preview, "_viewer", None) and self.preview._viewer.winfo_exists():
+                return
+        except Exception:
+            pass
+        foc = self.focus_get()
+        if foc is not None:
+            try:
+                # CTkEntry / CTkTextbox or native Entry/Text should keep arrow keys
+                if isinstance(foc, (ctk.CTkEntry, ctk.CTkTextbox)):
+                    return
+                cname = foc.winfo_class()
+                if cname in ("Entry", "Text"):
+                    return
+                # heuristic for CTk's internal entry canvas
+                if "entry" in str(foc).lower():
+                    return
+            except Exception:
+                pass
+        try:
+            self.preview._parent_canvas.yview_scroll(int(delta), "units")
+        except Exception:
+            pass
+
     def _build_ui(self):
         # --- Header ---
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -1066,6 +1139,12 @@ class SDMoverApp(ctk.CTk):
             self, text="Ready", font=("", 10), text_color="gray55", anchor="w",
         )
         self.footer.pack(fill="x", padx=20, pady=(2, 8))
+
+        # Arrow keys scroll the preview grid (viewer handles its own keys when open)
+        self.bind("<Up>", lambda e: self._scroll_preview(-3))
+        self.bind("<Down>", lambda e: self._scroll_preview(3))
+        self.bind("<Prior>", lambda e: self._scroll_preview(-12))
+        self.bind("<Next>", lambda e: self._scroll_preview(12))
 
     # ---- Left panel ----
 
