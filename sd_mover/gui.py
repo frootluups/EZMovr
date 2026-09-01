@@ -46,7 +46,7 @@ THUMB_SIZE = (120, 90)
 LARGE_PREVIEW_MAX = (960, 640)
 THUMB_PAD = 6
 COLS = 3
-THUMB_WORKERS = min(4, (os.cpu_count() or 4))
+THUMB_WORKERS = 1
 _THUMB_CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "EZMovr" / "thumb_cache"
 try:
     _THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -518,16 +518,25 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
             self._ratings.pop(key, None)
         card = self._card_map.get(key)
         if card is not None:
-            stars = getattr(card, "_stars", None)
-            if stars:
-                for i, lbl in enumerate(stars):
-                    n = i + 1
-                    filled = n <= rating
-                    try:
-                        lbl.configure(text="★" if filled else "☆",
-                                      text_color="#FACC15" if filled else "gray60")
-                    except Exception:
-                        pass
+            # single-label stars (current) — one widget with 5 chars
+            star_label = getattr(card, "_star_label", None)
+            if star_label is not None:
+                try:
+                    star_label.configure(text="★" * rating + "☆" * (5 - rating),
+                                         text_color="#FACC15" if rating else "gray60")
+                except Exception:
+                    pass
+            else:
+                stars = getattr(card, "_stars", None)
+                if stars:
+                    for i, lbl in enumerate(stars):
+                        n = i + 1
+                        filled = n <= rating
+                        try:
+                            lbl.configure(text="★" if filled else "☆",
+                                          text_color="#FACC15" if filled else "gray60")
+                        except Exception:
+                            pass
         if getattr(self, "_viewer", None) is not None:
             try:
                 if self._viewer.winfo_exists():
@@ -699,7 +708,7 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
                 img = Image.open(BytesIO(thumb))
                 img.thumbnail(THUMB_SIZE, Image.BILINEAR)
                 out = img.convert("RGB")
-                self._save_thumb_cache(path, out)
+                threading.Thread(target=self._save_thumb_cache, args=(path, out), daemon=True).start()
                 return out
         except Exception:
             pass
@@ -956,34 +965,43 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         ctk.CTkLabel(card, text=short, font=("Consolas", 9), text_color="gray70").pack(
             padx=4, pady=(0, 2),
         )
-        # star rating row (5 clickable stars)
-        star_frame = ctk.CTkFrame(card, fg_color="transparent")
-        star_frame.pack(pady=(0, 4))
-        stars = []
+        # single-label star row (5 stars in one widget — ~5× fewer widgets)
         cur = self.get_rating(path)
-        for i in range(1, 6):
-            filled = i <= cur
-            lbl = ctk.CTkLabel(
-                star_frame, text="★" if filled else "☆", font=("", 13),
-                text_color="#FACC15" if filled else "gray60", width=16,
-            )
-            lbl._is_star = True
-            cb = lambda e, p=path, r=i: self._on_star_click(p, r)
-            try:
-                lbl.bind("<Button-1>", cb, add="+")
-            except Exception:
-                pass
-            for attr in ("_canvas", "_label"):
-                inner = getattr(lbl, attr, None)
-                if inner is not None:
-                    try:
-                        inner.bind("<Button-1>", cb, add="+")
-                    except Exception:
-                        pass
-            lbl.pack(side="left", padx=1)
-            stars.append(lbl)
-        card._stars = stars
+        star_label = ctk.CTkLabel(
+            card, text="★" * cur + "☆" * (5 - cur), font=("", 13),
+            text_color="#FACC15" if cur else "gray60", cursor="hand2",
+        )
+        star_label._is_star = True
         card._path = str(path)
+
+        def _star_click(e):
+            try:
+                w = star_label.winfo_width()
+                if w <= 1:
+                    w = 80
+                rel = e.x / w
+                rel = max(0.0, min(1.0, rel))
+                r = int(rel * 5) + 1
+                if r < 1:
+                    r = 1
+                if r > 5:
+                    r = 5
+                self._on_star_click(path, r)
+            except Exception:
+                self._on_star_click(path, 3)
+            return "break"
+
+        star_label.bind("<Button-1>", _star_click, add="+")
+        for attr in ("_canvas", "_label"):
+            inner = getattr(star_label, attr, None)
+            if inner is not None:
+                try:
+                    inner.bind("<Button-1>", _star_click, add="+")
+                except Exception:
+                    pass
+        star_label.pack(pady=(0, 4))
+        card._stars = [star_label]
+        card._star_label = star_label
         return card
 
 
