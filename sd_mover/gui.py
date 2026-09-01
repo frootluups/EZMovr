@@ -4,6 +4,7 @@ import concurrent.futures
 import hashlib
 import os
 import queue
+import sys
 import tempfile
 import threading
 import time
@@ -337,9 +338,16 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         self._large_cache_order = []
         self._viewer = None
         self._relayout_pending = False
+        self._in_relayout = False
         self._last_relayout_width = 0
         self._oled = False
         self.bind("<Configure>", self._on_resize)
+        # Trackpad: ensure small deltas scroll (also handle scroll over cards)
+        self._parent_canvas.bind("<MouseWheel>", self._on_mouse_wheel, add=True)
+        self.bind("<MouseWheel>", self._on_mouse_wheel, add=True)
+        if not sys.platform.startswith("win"):
+            self.bind("<Button-4>", lambda e: self._on_mouse_wheel_linux(-1), add=True)
+            self.bind("<Button-5>", lambda e: self._on_mouse_wheel_linux(1), add=True)
 
     # ---- theme ----
 
@@ -774,8 +782,11 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
                 if item[0] == "__counts__":
                     self._section_counts = item[1]
                     continue
-                category, path, kind, pil = item
-                self._add_thumb(category, path, kind, pil)
+                try:
+                    category, path, kind, pil = item
+                    self._add_thumb(category, path, kind, pil)
+                except Exception as e:
+                    print(f"thumb failed for {item}: {e}")
                 rendered += 1
         self._rendered += rendered
 
@@ -802,7 +813,7 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         return max(1, min(width // cell, 8))
 
     def _on_resize(self, event):
-        if event.widget is not self or self._relayout_pending:
+        if event.widget is not self or self._relayout_pending or getattr(self, "_in_relayout", False):
             return
         # Only relayout on actual width changes — repacking thumbnails fires
         # Configure events too, and relayouting on those would loop forever.
@@ -811,6 +822,39 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         self._relayout_pending = True
         self.after(120, self._do_relayout)
 
+    def _on_mouse_wheel(self, event):
+        if not self._check_if_valid_scroll(event.widget):
+            return
+        try:
+            delta = int(event.delta)
+        except Exception:
+            delta = 0
+        if delta == 0:
+            return "break"
+        units = -int(delta / 30)
+        if units == 0:
+            units = -1 if delta > 0 else 1
+        if abs(units) > 6:
+            units = 6 if units > 0 else -6
+        try:
+            if getattr(self, "_shift_pressed", False):
+                if self._parent_canvas.xview() != (0.0, 1.0):
+                    self._parent_canvas.xview_scroll(units, "units")
+            else:
+                if self._parent_canvas.yview() != (0.0, 1.0):
+                    self._parent_canvas.yview_scroll(units, "units")
+        except Exception:
+            pass
+        return "break"
+
+    def _on_mouse_wheel_linux(self, delta):
+        try:
+            if self._parent_canvas.yview() != (0.0, 1.0):
+                self._parent_canvas.yview_scroll(delta, "units")
+        except Exception:
+            pass
+        return "break"
+
     def _do_relayout(self):
         self._relayout_pending = False
         self._relayout()
@@ -818,44 +862,71 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
     def _relayout(self):
         if not self._sections:
             return
-        # Unbind during the rebuild so our own repacking can't retrigger a
-        # relayout (which would freeze the UI in an infinite loop).
-        self.unbind("<Configure>")
+        if getattr(self, "_in_relayout", False):
+            return
+        self._in_relayout = True
         try:
             self._last_relayout_width = self.winfo_width()
             cols = self._compute_cols()
             self._relayout_impl(cols)
+            try:
+                self._parent_canvas.configure(scrollregion=self._parent_canvas.bbox("all"))
+            except Exception:
+                pass
         finally:
-            self.bind("<Configure>", self._on_resize)
+            self._in_relayout = False
 
     def _relayout_impl(self, cols):
-        # Reparent every card up to `self` so destroying row frames won't
-        # delete them, then drop the old headers and row frames.
+        # Forget headers and content, then re-grid with new column count
         for sec in self._sections:
-            for c in sec["cards"]:
-                c.pack(in_=self)
             if sec.get("header") is not None:
-                sec["header"].destroy()
+                try:
+                    sec["header"].pack_forget()
+                    sec["header"].destroy()
+                except Exception:
+                    pass
                 sec["header"] = None
-        for r in self._row_frames:
-            r.destroy()
+            try:
+                sec["content"].pack_forget()
+            except Exception:
+                pass
+            for card in sec["cards"]:
+                try:
+                    card.grid_forget()
+                except Exception:
+                    try:
+                        card.pack_forget()
+                    except Exception:
+                        pass
+        for r in list(self._row_frames):
+            try:
+                r.destroy()
+            except Exception:
+                pass
         self._row_frames = []
         self._current_section = None
 
         for sec in self._sections:
-            self._current_section = sec["cat"]
             sec["header"] = self._make_header(sec["cat"])
-            self._row_frames = []
-            self._row_count = 0
+            sec["header"].pack(fill="x", padx=2, pady=(12, 4))
+            sec["content"].pack(fill="x", padx=2, pady=(0, 8))
+            for c in range(cols):
+                try:
+                    sec["content"].grid_columnconfigure(c, weight=1)
+                except Exception:
+                    pass
             for i, card in enumerate(sec["cards"]):
-                if i % cols == 0:
-                    row = ctk.CTkFrame(self, fg_color="transparent")
-                    row.pack(fill="x", pady=THUMB_PAD)
-                    self._row_frames.append(row)
-                cell = ctk.CTkFrame(self._row_frames[-1], fg_color="transparent")
-                cell.pack(side="left", padx=THUMB_PAD, expand=True, fill="x")
-                card.pack(in_=cell, padx=4, pady=(4, 0))
-                self._row_count += 1
+                row = i // cols
+                col = i % cols
+                try:
+                    card.grid(in_=sec["content"], row=row, column=col, padx=THUMB_PAD, pady=THUMB_PAD, sticky="nsew")
+                except Exception:
+                    try:
+                        card.pack(in_=sec["content"])
+                    except Exception:
+                        pass
+        self._row_count = sum(len(s["cards"]) for s in self._sections)
+        self._current_section = self._sections[-1]["cat"] if self._sections else None
 
     def _make_header(self, category):
         label = self.SECTION_LABELS.get(category, category.title())
@@ -883,35 +954,45 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
 
     def _start_section(self, category):
         self._current_section = category
-        self._sections.append({"cat": category, "cards": [], "header": None})
-        self._row_frames.clear()
-        self._row_count = 0
-        self._sections[-1]["header"] = self._make_header(category)
+        header = self._make_header(category)
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.pack(fill="x", padx=2, pady=(0, 8))
+        cols = self._compute_cols()
+        for c in range(cols):
+            content.grid_columnconfigure(c, weight=1)
+        self._sections.append({"cat": category, "cards": [], "header": header, "content": content, "grid_cols": cols})
 
     def _add_thumb(self, category, path, kind, pil):
-        # accept both Path and str (tests use str)
         if isinstance(path, str):
             path = Path(path)
         if category != self._current_section:
             self._start_section(category)
 
+        sec = self._sections[-1]
+        content = sec["content"]
         cols = self._compute_cols()
-        if self._row_count % cols == 0:
-            row = ctk.CTkFrame(self, fg_color="transparent")
-            row.pack(fill="x", pady=THUMB_PAD)
-            self._row_frames.append(row)
-        parent = self._row_frames[-1]
-
-        cell = ctk.CTkFrame(parent, fg_color="transparent")
-        cell.pack(side="left", padx=THUMB_PAD, expand=True, fill="x")
-        self._row_count += 1
-
-        card = self._build_card(path, kind, pil)
-        card.pack(in_=cell, padx=4, pady=(4, 0))
-        self._sections[-1]["cards"].append(card)
-        self._preview_items.append((path, kind))
-        self._card_map[str(path)] = card
-        self._bind_card_click(card, path)
+        for c in range(cols):
+            try:
+                content.grid_columnconfigure(c, weight=1)
+            except Exception:
+                pass
+        sec["grid_cols"] = cols
+        idx = len(sec["cards"])
+        row = idx // cols
+        col = idx % cols
+        try:
+            card = self._build_card(path, kind, pil)
+            card.grid(in_=content, row=row, column=col, padx=THUMB_PAD, pady=THUMB_PAD, sticky="nsew")
+            sec["cards"].append(card)
+            self._preview_items.append((path, kind))
+            self._card_map[str(path)] = card
+            self._bind_card_click(card, path)
+        except Exception as e:
+            try:
+                self._preview_items.append((path, kind))
+            except Exception:
+                pass
+            print(f"card failed for {path}: {e}")
 
     def _on_star_click(self, path, rating):
         self.set_rating(path, rating)
@@ -969,7 +1050,7 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         cur = self.get_rating(path)
         star_label = ctk.CTkLabel(
             card, text="★" * cur + "☆" * (5 - cur), font=("", 13),
-            text_color="#FACC15" if cur else "gray60", cursor="hand2",
+            text_color="#FACC15" if cur else "gray60",
         )
         star_label._is_star = True
         card._path = str(path)
