@@ -1,14 +1,23 @@
 """CustomTkinter GUI for the EZMovr."""
 
+import concurrent.futures
+import hashlib
 import os
 import queue
+import tempfile
 import threading
 import time
-import customtkinter as ctk
+from io import BytesIO
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
+import customtkinter as ctk
 from PIL import Image, ImageOps
+
+try:
+    import piexif  # noqa: F401
+except Exception:
+    piexif = None  # type: ignore
 
 from .drive_detector import get_removable_drives, format_drive_info
 from .file_scanner import (
@@ -20,7 +29,7 @@ from .file_scanner import (
     RAW_EXTENSIONS,
 )
 from .folder_builder import get_destination, ensure_folder
-from .file_copier import copy_files
+from .file_copier import copy_file, copy_files, write_rating
 from . import settings
 from .onboarding import OnboardingWindow
 
@@ -34,8 +43,16 @@ VIDEO_COLOR = "#8B5CF6"
 RAW_COLOR = "#D97706"
 EMPTY_MSG = "Insert an SD card and click Scan to begin."
 THUMB_SIZE = (120, 90)
+LARGE_PREVIEW_MAX = (960, 640)
 THUMB_PAD = 6
 COLS = 3
+THUMB_WORKERS = min(4, (os.cpu_count() or 4))
+_THUMB_CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "EZMovr" / "thumb_cache"
+try:
+    _THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    _THUMB_CACHE_DIR = Path(tempfile.gettempdir()) / "EZMovr_thumb_cache"
+    _THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 CARD_FG = ("gray92", "#1f1f1f")
 CARD_BORDER = ("gray85", "#2d2d2d")
@@ -57,6 +74,199 @@ _BADGE_GLYPHS = {"video": "||", "raw": "RAW", "fail": "!", "other": "FILE",
 
 def badge_text(kind):
     return _BADGE_GLYPHS.get(kind, "FILE")
+
+
+class LargePreviewWindow(ctk.CTkToplevel):
+    """Modal window that shows a single file at near-full size."""
+
+    def __init__(self, master, panel, start_idx=0):
+        super().__init__(master)
+        self.panel = panel
+        self.idx = start_idx
+        self._img_ref = None
+
+        self.title("Preview")
+        self.geometry("980x720")
+        self.minsize(640, 480)
+        self.transient(master)
+        # Match panel theme
+        try:
+            bg = OLED_BG if getattr(panel, "_oled", False) else ("gray92", "#1f1f1f")
+            self.configure(fg_color=bg)
+        except Exception:
+            pass
+        self._center_on_master()
+
+        self._build_ui()
+        self._show_current()
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Left>", lambda e: self._prev())
+        self.bind("<Right>", lambda e: self._next())
+        self.focus_set()
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # keep panel ref in sync
+        try:
+            self.panel._viewer = self
+        except Exception:
+            pass
+
+    def _center_on_master(self):
+        try:
+            self.update_idletasks()
+            mx = self.master.winfo_x()
+            my = self.master.winfo_y()
+            mw = self.master.winfo_width()
+            mh = self.master.winfo_height()
+            ww = 980
+            wh = 720
+            x = max(mx + (mw - ww) // 2, 0)
+            y = max(my + (mh - wh) // 2, 0)
+            self.geometry(f"{ww}x{wh}+{x}+{y}")
+        except Exception:
+            pass
+
+    def _build_ui(self):
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=12, pady=(10, 4))
+
+        self.name_label = ctk.CTkLabel(top, text="", font=("", 13, "bold"), anchor="w")
+        self.name_label.pack(side="left", fill="x", expand=True)
+
+        self.counter_label = ctk.CTkLabel(top, text="", font=("", 11), text_color="gray55")
+        self.counter_label.pack(side="right", padx=8)
+
+        ctk.CTkButton(
+            top, text="Close", width=70, height=28,
+            fg_color=("gray65", "#3a3a3a"), hover_color=("gray55", "#4a4a4a"),
+            command=self._on_close,
+        ).pack(side="right", padx=4)
+
+        # Image area — expands and centers the picture
+        self.img_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.img_frame.pack(fill="both", expand=True, padx=12, pady=6)
+
+        self.img_label = ctk.CTkLabel(self.img_frame, text="Loading...", font=("", 13))
+        self.img_label.pack(expand=True)
+
+        # Star rating row (click to rate current image)
+        self.star_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.star_frame.pack(pady=4)
+        self.star_labels = []
+        for i in range(1, 6):
+            lbl = ctk.CTkLabel(self.star_frame, text="☆", font=("", 20), text_color="gray60", width=28)
+            lbl.pack(side="left", padx=2)
+            # capture i correctly
+            lbl.bind("<Button-1>", lambda e, r=i: self._on_star(r), add="+")
+            try:
+                if hasattr(lbl, "_canvas") and lbl._canvas is not None:
+                    lbl._canvas.bind("<Button-1>", lambda e, r=i: self._on_star(r), add="+")
+            except Exception:
+                pass
+            self.star_labels.append(lbl)
+
+        nav = ctk.CTkFrame(self, fg_color="transparent")
+        nav.pack(fill="x", padx=12, pady=(4, 12))
+
+        self.prev_btn = ctk.CTkButton(nav, text="< Prev", width=100, command=self._prev)
+        self.prev_btn.pack(side="left")
+
+        ctk.CTkLabel(nav, text="  Use Left / Right arrows, Esc to close  ",
+                     font=("", 10), text_color="gray55").pack(side="left", expand=True)
+
+        self.next_btn = ctk.CTkButton(nav, text="Next >", width=100, command=self._next)
+        self.next_btn.pack(side="right")
+
+    def _on_close(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        try:
+            if getattr(self.panel, "_viewer", None) is self:
+                self.panel._viewer = None
+        except Exception:
+            pass
+        self.destroy()
+
+    def show_at(self, idx):
+        n = len(getattr(self.panel, "_preview_items", []))
+        if not n:
+            return
+        self.idx = max(0, min(idx, n - 1))
+        self._show_current()
+        self.lift()
+
+    def _prev(self):
+        if self.idx > 0:
+            self.idx -= 1
+            self._show_current()
+
+    def _next(self):
+        n = len(getattr(self.panel, "_preview_items", []))
+        if self.idx + 1 < n:
+            self.idx += 1
+            self._show_current()
+
+    def _show_current(self):
+        items = getattr(self.panel, "_preview_items", [])
+        if not items or not (0 <= self.idx < len(items)):
+            return
+        path, kind = items[self.idx]
+        self.name_label.configure(text=path.name)
+        self.counter_label.configure(text=f"{self.idx + 1} / {len(items)}")
+
+        # Nav state
+        try:
+            self.prev_btn.configure(state="normal" if self.idx > 0 else "disabled")
+            self.next_btn.configure(state="normal" if self.idx + 1 < len(items) else "disabled")
+        except Exception:
+            pass
+
+        if kind == "img":
+            pil = self.panel._load_large_preview(path)
+            if pil is not None:
+                self._img_ref = ctk.CTkImage(light_image=pil, dark_image=pil,
+                                             size=(pil.width, pil.height))
+                self.img_label.configure(image=self._img_ref, text="")
+                self._refresh_stars()
+                return
+
+        # Video / RAW without thumb / other / load failed -> large placeholder
+        badge, subtitle = {
+            "video": (VIDEO_COLOR, "Video"),
+            "raw": (RAW_COLOR, "RAW"),
+            "fail": (DANGER, "Cannot preview"),
+            "other": ("gray55", "File"),
+        }.get(kind, ("gray55", "File"))
+        # Reuse the image label as a large badge
+        self._img_ref = None
+        self.img_label.configure(image="", text=f"{badge_text(kind)}\n{subtitle}",
+                                 font=("", 28, "bold"), text_color=badge)
+        self._refresh_stars()
+
+    def _on_star(self, rating):
+        try:
+            path, _k = self.panel._preview_items[self.idx]
+            self.panel.set_rating(path, rating)
+            self._refresh_stars()
+        except Exception:
+            pass
+
+    def _refresh_stars(self):
+        try:
+            path, _k = self.panel._preview_items[self.idx]
+            cur = self.panel.get_rating(path)
+        except Exception:
+            cur = 0
+        for i, lbl in enumerate(getattr(self, "star_labels", [])):
+            filled = (i + 1) <= cur
+            lbl.configure(text="★" if filled else "☆",
+                          text_color="#FACC15" if filled else "gray60")
 
 
 class PhotoPreviewPanel(ctk.CTkScrollableFrame):
@@ -92,6 +302,9 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         self._row_frames = []
         self._row_count = 0
         self._sections = []  # [{cat, cards:[...], header:widget}]
+        self._preview_items = []  # [(Path, kind)] in display order
+        self._ratings = {}  # {str(Path): 0-5}
+        self._viewer = None
         self._relayout_pending = False
         self._last_relayout_width = 0
         self._oled = False
@@ -120,6 +333,168 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
                 walk(child)
         walk(self)
 
+    # ---- thumb cache (disk) — direct from card, then cached locally ----
+
+    def _thumb_cache_key(self, path):
+        try:
+            st = path.stat()
+            raw = f"{path}|{st.st_size}|{int(st.st_mtime)}".encode("utf-8", errors="ignore")
+        except Exception:
+            raw = str(path).encode("utf-8", errors="ignore")
+        return hashlib.md5(raw).hexdigest() + ".jpg"
+
+    def _load_cached_thumb(self, path):
+        try:
+            p = _THUMB_CACHE_DIR / self._thumb_cache_key(path)
+            if p.is_file():
+                # cache hit — load directly from local disk (faster than SD)
+                img = Image.open(p)
+                img.load()
+                # ensure it fits thumb size (cache already thumb-sized)
+                return img.convert("RGB")
+        except Exception:
+            pass
+        return None
+
+    def _save_thumb_cache(self, path, pil):
+        try:
+            p = _THUMB_CACHE_DIR / self._thumb_cache_key(path)
+            # save as JPEG, small & fast
+            pil.save(p, "JPEG", quality=85)
+        except Exception:
+            pass
+
+    def _load_large_preview(self, path):
+        ext = path.suffix.lower()
+        if ext in VIDEO_EXTENSIONS:
+            return None
+        if ext in RAW_EXTENSIONS:
+            try:
+                import rawpy
+                with rawpy.imread(str(path)) as raw:
+                    rgb = raw.postprocess(use_camera_wb=True, half_size=True)
+                    orient = int(getattr(raw, "orientation", 1) or 1)
+                img = Image.fromarray(rgb)
+                if orient == 3:
+                    img = img.rotate(180)
+                elif orient in (5, 6, 7, 8):
+                    img = img.rotate(270)
+                img.thumbnail(LARGE_PREVIEW_MAX, Image.BILINEAR)
+                return img.convert("RGB")
+            except Exception:
+                return None
+        if ext in IMAGE_EXTENSIONS:
+            img = None
+            try:
+                img = Image.open(path)
+                img.draft("RGB", LARGE_PREVIEW_MAX)
+                try:
+                    orient = img.getexif().get(0x0112, 1)
+                except Exception:
+                    orient = 1
+                if orient not in (1, None, 0):
+                    img = ImageOps.exif_transpose(img)
+                img.thumbnail(LARGE_PREVIEW_MAX, Image.BILINEAR)
+                out = img.convert("RGB").copy()
+                return out
+            except Exception:
+                return None
+            finally:
+                if img is not None:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+        return None
+
+    def open_viewer(self, path):
+        idx = 0
+        for i, (p, _k) in enumerate(self._preview_items):
+            if p == path:
+                idx = i
+                break
+        if getattr(self, "_viewer", None) is not None:
+            try:
+                if self._viewer.winfo_exists():
+                    self._viewer.show_at(idx)
+                    self._viewer.lift()
+                    self._viewer.focus_set()
+                    return
+            except Exception:
+                pass
+            self._viewer = None
+        try:
+            self._viewer = LargePreviewWindow(self.winfo_toplevel(), self, idx)
+        except Exception:
+            # If transient/grab fails, try without grab
+            self._viewer = LargePreviewWindow(self.winfo_toplevel(), self, idx)
+
+    def _bind_card_click(self, widget, path):
+        if getattr(widget, "_is_star", False):
+            return
+        cb = lambda e, p=path: self.open_viewer(p)
+        for w in (widget, getattr(widget, "_canvas", None), getattr(widget, "_label", None)):
+            if w is None:
+                continue
+            if getattr(w, "_is_star", False):
+                continue
+            try:
+                w.bind("<Button-1>", cb, add="+")
+            except Exception:
+                pass
+            try:
+                w.configure(cursor="hand2")
+            except Exception:
+                pass
+        for child in widget.winfo_children():
+            if getattr(child, "_is_star", False):
+                continue
+            self._bind_card_click(child, path)
+        # CTk widgets sometimes keep an inner canvas under a different attr
+        for attr in ("_canvas", "_label", "_text_label"):
+            inner = getattr(widget, attr, None)
+            if inner is not None and inner is not widget and not getattr(inner, "_is_star", False):
+                try:
+                    inner.bind("<Button-1>", cb, add="+")
+                except Exception:
+                    pass
+
+    def get_rating(self, path):
+        return self._ratings.get(str(path), 0)
+
+    def set_rating(self, path, rating):
+        key = str(path)
+        cur = self._ratings.get(key, 0)
+        # clicking same star clears it
+        if cur == rating:
+            rating = 0
+        if rating:
+            self._ratings[key] = rating
+        else:
+            self._ratings.pop(key, None)
+        # update card stars
+        for sec in self._sections:
+            for card in sec["cards"]:
+                if str(getattr(card, "_path", "")) == key:
+                    stars = getattr(card, "_stars", None)
+                    if stars:
+                        for i, lbl in enumerate(stars):
+                            n = i + 1
+                            filled = n <= rating
+                            lbl.configure(text="★" if filled else "☆",
+                                          text_color="#FACC15" if filled else "gray60")
+                    break
+        # update large viewer if it shows this file
+        if getattr(self, "_viewer", None) is not None:
+            try:
+                if self._viewer.winfo_exists():
+                    cur_p, _k = self._preview_items[self._viewer.idx]
+                    if str(cur_p) == key:
+                        self._viewer._refresh_stars()
+            except Exception:
+                pass
+        return rating
+
     # ---- public API ----
 
     def clear(self):
@@ -133,6 +508,15 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         self._current_section = None
         self._row_count = 0
         self._sections = []
+        self._preview_items = []
+        self._ratings.clear()
+        if getattr(self, "_viewer", None) is not None:
+            try:
+                if self._viewer.winfo_exists():
+                    self._viewer.destroy()
+            except Exception:
+                pass
+            self._viewer = None
         self._relayout_pending = False
         self._rendered = 0
         self._loading_label = None
@@ -180,17 +564,41 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         order = {c: i for i, c in enumerate(self.SECTION_ORDER)}
         categorized.sort(key=lambda x: order.get(x[0], 99))
 
-        # Phase 2 — decode thumbnails (single open each) and stream them.
-        batch = []
-        for cat, f in categorized:
+        # Phase 2 — decode thumbnails in parallel, direct from card.
+        # Each worker opens its own file (no shared buffer), BILINEAR +
+        # EXIF-thumb + disk cache make it ~3-4× faster than sequential.
+        def _decode_one(item):
+            cat, f = item
             if self._gen_id != gen:
-                return
+                return None
             kind, pil = self._classify(f)
-            batch.append((cat, f.name, kind, pil))
-            if len(batch) >= self.BATCH:
-                self._queue.put(batch)
-                batch = []
-                time.sleep(0.004)  # let the UI pump keep pace
+            return (cat, f, kind, pil)
+
+        batch = []
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=THUMB_WORKERS) as ex:
+                for result in ex.map(_decode_one, categorized):
+                    if self._gen_id != gen:
+                        ex.shutdown(wait=False, cancel_futures=True)
+                        return
+                    if result is None:
+                        continue
+                    batch.append(result)
+                    if len(batch) >= self.BATCH:
+                        self._queue.put(batch)
+                        batch = []
+                        time.sleep(0.003)
+        except Exception:
+            # fallback to sequential if thread pool fails
+            batch = []
+            for cat, f in categorized:
+                if self._gen_id != gen:
+                    return
+                kind, pil = self._classify(f)
+                batch.append((cat, f, kind, pil))
+                if len(batch) >= self.BATCH:
+                    self._queue.put(batch)
+                    batch = []
         if batch:
             self._queue.put(batch)
 
@@ -231,22 +639,54 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         return "other", None
 
     def _load_pil(self, path):
+        # 0) local disk cache — no SD access at all
+        cached = self._load_cached_thumb(path)
+        if cached is not None:
+            return cached
+
+        # 1) embedded EXIF thumbnail (tiny JPEG stored by camera, ~10KB)
+        try:
+            import piexif
+            exif_dict = piexif.load(str(path))
+            thumb = exif_dict.get("thumbnail")
+            if thumb:
+                img = Image.open(BytesIO(thumb))
+                img.thumbnail(THUMB_SIZE, Image.BILINEAR)
+                out = img.convert("RGB")
+                self._save_thumb_cache(path, out)
+                return out
+        except Exception:
+            pass
+
+        # 2) direct card access — draft + BILINEAR, skip transpose if not needed
         img = None
         try:
             img = Image.open(path)
-            img.draft("RGB", THUMB_SIZE)  # fast JPEG decode header preview
-            img = ImageOps.exif_transpose(img)  # honor camera orientation
-            img.thumbnail(THUMB_SIZE, Image.LANCZOS)
+            img.draft("RGB", THUMB_SIZE)  # JPEG fast-path, read directly from card
+            try:
+                orient = img.getexif().get(0x0112, 1)
+            except Exception:
+                orient = 1
+            if orient not in (1, None, 0):
+                img = ImageOps.exif_transpose(img)
+            img.thumbnail(THUMB_SIZE, Image.BILINEAR)
             out = img.convert("RGB").copy()
+            self._save_thumb_cache(path, out)
             return out
         except Exception:
             return None
         finally:
             if img is not None:
-                img.close()
+                try:
+                    img.close()
+                except Exception:
+                    pass
 
     def _load_raw_pil(self, path):
         """Render a RAW preview via rawpy (CR2, NEF, ARW, DNG, etc.)."""
+        cached = self._load_cached_thumb(path)
+        if cached is not None:
+            return cached
         try:
             import rawpy
             with rawpy.imread(str(path)) as raw:
@@ -257,8 +697,10 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
                 img = img.rotate(180)
             elif orient in (5, 6, 7, 8):
                 img = img.rotate(270)
-            img.thumbnail(THUMB_SIZE, Image.LANCZOS)
-            return img.convert("RGB")
+            img.thumbnail(THUMB_SIZE, Image.BILINEAR)
+            out = img.convert("RGB")
+            self._save_thumb_cache(path, out)
+            return out
         except Exception:
             return None
 
@@ -277,8 +719,8 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
                 if item[0] == "__counts__":
                     self._section_counts = item[1]
                     continue
-                category, name, kind, pil = item
-                self._add_thumb(category, name, kind, pil)
+                category, path, kind, pil = item
+                self._add_thumb(category, path, kind, pil)
                 rendered += 1
         self._rendered += rendered
 
@@ -391,7 +833,10 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         self._row_count = 0
         self._sections[-1]["header"] = self._make_header(category)
 
-    def _add_thumb(self, category, name, kind, pil):
+    def _add_thumb(self, category, path, kind, pil):
+        # accept both Path and str (tests use str)
+        if isinstance(path, str):
+            path = Path(path)
         if category != self._current_section:
             self._start_section(category)
 
@@ -406,11 +851,18 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         cell.pack(side="left", padx=THUMB_PAD, expand=True, fill="x")
         self._row_count += 1
 
-        card = self._build_card(name, kind, pil)
+        card = self._build_card(path, kind, pil)
         card.pack(in_=cell, padx=4, pady=(4, 0))
         self._sections[-1]["cards"].append(card)
+        self._preview_items.append((path, kind))
+        self._bind_card_click(card, path)
 
-    def _build_card(self, name, kind, pil):
+    def _on_star_click(self, path, rating):
+        self.set_rating(path, rating)
+        return "break"
+
+    def _build_card(self, path, kind, pil):
+        name = path.name if hasattr(path, "name") else str(path)
         card = ctk.CTkFrame(
             self,
             fg_color=self._oled_val(CARD_FG, OLED_CARD_FG),
@@ -455,8 +907,36 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
 
         short = name if len(name) < 18 else name[:15] + "..."
         ctk.CTkLabel(card, text=short, font=("Consolas", 9), text_color="gray70").pack(
-            padx=4, pady=(0, 4),
+            padx=4, pady=(0, 2),
         )
+        # star rating row (5 clickable stars)
+        star_frame = ctk.CTkFrame(card, fg_color="transparent")
+        star_frame.pack(pady=(0, 4))
+        stars = []
+        cur = self.get_rating(path)
+        for i in range(1, 6):
+            filled = i <= cur
+            lbl = ctk.CTkLabel(
+                star_frame, text="★" if filled else "☆", font=("", 13),
+                text_color="#FACC15" if filled else "gray60", width=16,
+            )
+            lbl._is_star = True
+            cb = lambda e, p=path, r=i: self._on_star_click(p, r)
+            try:
+                lbl.bind("<Button-1>", cb, add="+")
+            except Exception:
+                pass
+            for attr in ("_canvas", "_label"):
+                inner = getattr(lbl, attr, None)
+                if inner is not None:
+                    try:
+                        inner.bind("<Button-1>", cb, add="+")
+                    except Exception:
+                        pass
+            lbl.pack(side="left", padx=1)
+            stars.append(lbl)
+        card._stars = stars
+        card._path = str(path)
         return card
 
 
@@ -815,6 +1295,28 @@ class SDMoverApp(ctk.CTk):
             command=self._browse_folder,
         ).pack(side="left")
 
+        ctk.CTkLabel(inner, text="Rating export", font=("", 11, "bold")).grid(
+            row=5, column=0, sticky="w", pady=(8, 3),
+        )
+        rating_row = ctk.CTkFrame(inner, fg_color="transparent")
+        rating_row.grid(row=6, column=0, sticky="w")
+        self.rating_mode_var = ctk.StringVar(value="metadata")
+        ctk.CTkRadioButton(
+            rating_row, text="Write to metadata",
+            variable=self.rating_mode_var, value="metadata",
+            command=lambda: settings.set("rating_mode", self.rating_mode_var.get()),
+        ).pack(side="left", padx=(0, 10))
+        ctk.CTkRadioButton(
+            rating_row, text="Sort into 'rated' folder",
+            variable=self.rating_mode_var, value="folder",
+            command=lambda: settings.set("rating_mode", self.rating_mode_var.get()),
+        ).pack(side="left", padx=(0, 10))
+        ctk.CTkRadioButton(
+            rating_row, text="Both",
+            variable=self.rating_mode_var, value="both",
+            command=lambda: settings.set("rating_mode", self.rating_mode_var.get()),
+        ).pack(side="left")
+
     # ---- Helpers ----
 
     def _set_placeholder(self):
@@ -1019,7 +1521,43 @@ class SDMoverApp(ctk.CTk):
         def progress_cb(current, total, filename):
             self.after(0, self._update_progress, current, total, filename)
 
-        success, failed, failed_files = copy_files(self.scanned_files, dest, progress_cb)
+        rating_mode = self.rating_mode_var.get() if hasattr(self, "rating_mode_var") else "metadata"
+        ratings = getattr(self.preview, "_ratings", {})
+
+        def _rating_of(p):
+            return ratings.get(str(p), 0)
+
+        # folder mode: rated files go to dest/rated/
+        rated_dir = dest / "rated"
+        needs_rated = rating_mode in ("folder", "both") and any(_rating_of(p) > 0 for p in self.scanned_files)
+        if needs_rated:
+            try:
+                ensure_folder(rated_dir)
+            except Exception:
+                pass
+
+        total = len(self.scanned_files)
+        success = 0
+        failed = 0
+        failed_files = []
+        for i, src in enumerate(self.scanned_files, 1):
+            try:
+                if progress_cb:
+                    progress_cb(i, total, src.name)
+                r = _rating_of(src)
+                if rating_mode in ("folder", "both") and r > 0:
+                    dst = copy_file(src, rated_dir)
+                else:
+                    dst = copy_file(src, dest)
+                if rating_mode in ("metadata", "both") and r > 0:
+                    try:
+                        write_rating(dst, r)
+                    except Exception:
+                        pass
+                success += 1
+            except Exception as e:
+                failed += 1
+                failed_files.append((src, str(e)))
         self.after(0, self._copy_done, dest, success, failed, failed_files)
 
     def _update_progress(self, current, total, filename):
@@ -1080,6 +1618,7 @@ class SDMoverApp(ctk.CTk):
         self.mode_var.set(saved.get("default_mode", "all"))
         self.dest_mode_var.set(saved.get("default_dest_mode", "date"))
         self._toggle_dest_name()
+        self.rating_mode_var.set(saved.get("rating_mode", "metadata"))
 
         # Apply theme
         theme = saved.get("theme", "system")

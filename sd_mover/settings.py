@@ -18,6 +18,7 @@ def load_settings() -> dict:
         "default_mode": "all",
         "default_dest_mode": "date",
         "theme": "system",
+        "rating_mode": "metadata",
     }
 
     path = _get_settings_path()
