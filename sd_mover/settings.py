@@ -19,6 +19,10 @@ def load_settings() -> dict:
         "default_dest_mode": "date",
         "theme": "system",
         "rating_mode": "metadata",
+        "copy_selection": "all",
+        "rating_threshold": 1,
+        "verify_after_copy": False,
+        "thumb_size": "auto",
     }
 
     path = _get_settings_path()

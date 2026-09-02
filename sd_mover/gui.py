@@ -334,14 +334,17 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
         self._preview_items = []  # [(Path, kind)] in display order
         self._ratings = {}  # {str(Path): 0-5}
         self._card_map = {}  # {str(Path): card}
+        self._selected = set()  # {str(Path)}
+        self._filter = "all"
         self._large_cache = {}  # {str(Path): PIL}
         self._large_cache_order = []
         self._viewer = None
         self._relayout_pending = False
-        self._in_relayout = False
         self._last_relayout_width = 0
         self._oled = False
         self.bind("<Configure>", self._on_resize)
+        self.bind("<Control-a>", lambda e: (self.select_all(), "break")[1])
+        self.bind("<Control-A>", lambda e: (self.select_all(), "break")[1])
         # Trackpad: ensure small deltas scroll (also handle scroll over cards)
         self._parent_canvas.bind("<MouseWheel>", self._on_mouse_wheel, add=True)
         self.bind("<MouseWheel>", self._on_mouse_wheel, add=True)
@@ -553,7 +556,117 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
                         self._viewer._refresh_stars()
             except Exception:
                 pass
+        # re-apply filter if active (rated stars may change visibility)
+        try:
+            self.apply_filter()
+        except Exception:
+            pass
         return rating
+
+    def _on_select_toggle(self, path, checked):
+        key = str(path)
+        if checked:
+            self._selected.add(key)
+        else:
+            self._selected.discard(key)
+        card = self._card_map.get(key)
+        if card is not None:
+            try:
+                card.configure(border_color=ACCENT if checked else self._oled_val(CARD_BORDER, OLED_CARD_BORDER))
+            except Exception:
+                pass
+
+    def toggle_select(self, path):
+        key = str(path)
+        if key in self._selected:
+            self._selected.remove(key)
+        else:
+            self._selected.add(key)
+        card = self._card_map.get(key)
+        if card is not None:
+            try:
+                cb = getattr(card, "_sel_cb", None)
+                if cb:
+                    # update checkbox without triggering command
+                    pass
+                # visual cue: border accent when selected
+                card.configure(border_color=ACCENT if key in self._selected else self._oled_val(CARD_BORDER, OLED_CARD_BORDER))
+            except Exception:
+                pass
+
+    def select_all(self):
+        for p, _k in self._preview_items:
+            self._selected.add(str(p))
+        for key, card in self._card_map.items():
+            try:
+                card.configure(border_color=ACCENT)
+                if hasattr(card, "_sel_var"):
+                    card._sel_var.set(True)
+            except Exception:
+                pass
+
+    def clear_selection(self):
+        for key in list(self._selected):
+            card = self._card_map.get(key)
+            if card is not None:
+                try:
+                    card.configure(border_color=self._oled_val(CARD_BORDER, OLED_CARD_BORDER))
+                    if hasattr(card, "_sel_var"):
+                        card._sel_var.set(False)
+                except Exception:
+                    pass
+        self._selected.clear()
+
+    def get_selected_files(self):
+        # return Path objects for selected, fallback to all if none selected
+        if not self._selected:
+            return []
+        out = []
+        for p, _k in self._preview_items:
+            if str(p) in self._selected:
+                out.append(p)
+        return out
+
+    def set_filter(self, mode):
+        self._filter = mode
+        self.apply_filter()
+
+    def apply_filter(self):
+        # show/hide cards based on self._filter
+        try:
+            thr = 3 if self._filter == "rated3" else 1
+        except Exception:
+            thr = 1
+        for p, kind in self._preview_items:
+            key = str(p)
+            card = self._card_map.get(key)
+            if card is None:
+                continue
+            rating = self._ratings.get(key, 0)
+            show = True
+            if self._filter == "rated3":
+                show = rating >= 3
+            elif self._filter == "unrated":
+                show = rating == 0
+            elif self._filter == "raw":
+                show = kind in ("raw",) or str(p).lower().endswith((".cr2",".cr3",".nef",".arw",".raf",".orf",".rw2",".dng",".pef",".x3f"))
+            elif self._filter == "video":
+                show = kind == "video"
+            # else "all" show True
+            try:
+                # card is gridded inside its section's content; use grid_remove to hide but keep grid options
+                if show:
+                    card.grid()
+                else:
+                    card.grid_remove()
+            except Exception:
+                try:
+                    if show:
+                        card.pack()
+                    else:
+                        card.pack_forget()
+                except Exception:
+                    pass
 
     # ---- public API ----
 
@@ -1008,11 +1121,24 @@ class PhotoPreviewPanel(ctk.CTkScrollableFrame):
             border_color=self._oled_val(CARD_BORDER, OLED_CARD_BORDER),
         )
         card._is_card = True
-        card.bind("<Enter>", lambda e, c=card: c.configure(border_color=ACCENT))
+        # selection checkbox (top-right)
+        sel_var = ctk.BooleanVar(value=str(path) in self._selected)
+        cb = ctk.CTkCheckBox(card, text="", variable=sel_var, width=18, height=18, checkbox_width=18, checkbox_height=18, border_width=1, command=lambda p=path, v=sel_var: self._on_select_toggle(p, v.get()))
+        cb._is_star = True  # prevent card click binding
+        cb.pack(anchor="ne", padx=4, pady=(4, 0))
+        card._sel_var = sel_var
+        card._sel_cb = cb
+        # also handle the checkbox's internal canvas
+        try:
+            if hasattr(cb, "_canvas"):
+                cb._canvas._is_star = True
+        except Exception:
+            pass
+        card.bind("<Enter>", lambda e, c=card: c.configure(border_color=ACCENT if str(path) not in self._selected else "#3B82F6"))
         card.bind(
             "<Leave>",
             lambda e, c=card: c.configure(
-                border_color=self._oled_val(CARD_BORDER, OLED_CARD_BORDER)
+                border_color=self._oled_val(CARD_BORDER, OLED_CARD_BORDER) if str(path) not in self._selected else ACCENT
             ),
         )
 
@@ -1361,6 +1487,21 @@ class SDMoverApp(ctk.CTk):
     # ---- Right panel (preview) ----
 
     def _build_right_panel(self, parent):
+        # Filter bar
+        bar = ctk.CTkFrame(parent, fg_color="transparent")
+        bar.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(bar, text="Filter:", font=("", 11)).pack(side="left", padx=(0, 4))
+        self.filter_var = ctk.StringVar(value="all")
+        for label, val in [("All", "all"), ("★≥3", "rated3"), ("Unrated", "unrated"), ("RAW", "raw"), ("Video", "video")]:
+            ctk.CTkButton(
+                bar, text=label, width=60, height=24,
+                command=lambda v=val: self.preview.set_filter(v) if hasattr(self, "preview") else None,
+            ).pack(side="left", padx=2)
+        sel_bar = ctk.CTkFrame(parent, fg_color="transparent")
+        sel_bar.pack(fill="x", pady=(0, 6))
+        ctk.CTkButton(sel_bar, text="Select All", width=80, height=24, command=lambda: self.preview.select_all() if hasattr(self, "preview") else None).pack(side="left", padx=2)
+        ctk.CTkButton(sel_bar, text="Clear", width=60, height=24, command=lambda: self.preview.clear_selection() if hasattr(self, "preview") else None).pack(side="left", padx=2)
+        ctk.CTkButton(sel_bar, text="Copy Selected", width=110, height=24, fg_color=SUCCESS, hover_color=SUCCESS_HOVER, command=self._copy_selected).pack(side="right", padx=2)
         self.preview = PhotoPreviewPanel(
             parent,
             fg_color=("gray90", "#1e1e1e"),
@@ -1495,6 +1636,46 @@ class SDMoverApp(ctk.CTk):
             command=lambda: settings.set("rating_mode", self.rating_mode_var.get()),
         ).pack(side="left")
 
+        ctk.CTkLabel(inner, text="Copy selection", font=("", 11, "bold")).grid(
+            row=7, column=0, sticky="w", pady=(8, 3),
+        )
+        copy_sel_row = ctk.CTkFrame(inner, fg_color="transparent")
+        copy_sel_row.grid(row=8, column=0, sticky="w")
+        self.copy_selection_var = ctk.StringVar(value="all")
+        ctk.CTkOptionMenu(
+            copy_sel_row, variable=self.copy_selection_var, values=["All files", "Selected only"],
+            command=lambda v: settings.set("copy_selection", "selected" if "Selected" in v else "all"),
+            width=160,
+        ).pack(side="left")
+        ctk.CTkLabel(inner, text="Rated threshold (for 'rated' folder)", font=("", 11, "bold")).grid(
+            row=9, column=0, sticky="w", pady=(8, 3),
+        )
+        thresh_row = ctk.CTkFrame(inner, fg_color="transparent")
+        thresh_row.grid(row=10, column=0, sticky="w")
+        self.rating_threshold_var = ctk.IntVar(value=1)
+        self.rating_threshold_slider = ctk.CTkSlider(
+            thresh_row, from_=1, to=5, number_of_steps=4, width=150, command=self._on_rating_threshold_change,
+        )
+        self.rating_threshold_slider.pack(side="left")
+        self.rating_threshold_label = ctk.CTkLabel(thresh_row, text="≥1 ★", font=("", 11))
+        self.rating_threshold_label.pack(side="left", padx=8)
+        ctk.CTkLabel(inner, text="Performance", font=("", 11, "bold")).grid(
+            row=11, column=0, sticky="w", pady=(8, 3),
+        )
+        perf_row = ctk.CTkFrame(inner, fg_color="transparent")
+        perf_row.grid(row=12, column=0, sticky="w")
+        self.verify_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            perf_row, text="Verify after copy", variable=self.verify_var,
+            command=lambda: settings.set("verify_after_copy", bool(self.verify_var.get())),
+        ).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(perf_row, text="Thumb size:", font=("", 11)).pack(side="left", padx=(0, 4))
+        self.thumb_size_var = ctk.StringVar(value="auto")
+        ctk.CTkOptionMenu(
+            perf_row, variable=self.thumb_size_var, values=["Auto", "Small", "Medium", "Large"],
+            command=self._on_thumb_size_change, width=120,
+        ).pack(side="left")
+
     # ---- Helpers ----
 
     def _set_placeholder(self):
@@ -1514,6 +1695,36 @@ class SDMoverApp(ctk.CTk):
         folder = filedialog.askdirectory(title="Select base destination folder")
         if folder:
             self.base_folder_var.set(folder)
+
+    def _on_rating_threshold_change(self, value):
+        try:
+            v = int(round(float(value)))
+            v = max(1, min(5, v))
+            self.rating_threshold_var.set(v)
+            self.rating_threshold_label.configure(text=f"≥{v} ★")
+            settings.set("rating_threshold", v)
+        except Exception:
+            pass
+
+    def _on_thumb_size_change(self, choice):
+        val = str(choice).lower()
+        # normalize Auto/S/M/L
+        if val == "auto":
+            key = "auto"
+        elif val in ("small", "s"):
+            key = "S"
+        elif val in ("large", "l"):
+            key = "L"
+        else:
+            key = "M"
+        settings.set("thumb_size", key.lower() if key != "auto" else "auto")
+        # update global thumb size for next load
+        size_map = {"S": (90, 68), "M": (120, 90), "L": (150, 113)}
+        if key != "auto" and key in size_map:
+            # set global for next thumbnails (preview will use on next scan)
+            import sd_mover.gui as _g
+            _g.THUMB_SIZE = size_map[key]
+        self.footer.configure(text=f"Thumb size {key} — will apply on next scan")
 
     # ---- Theme ----
 
@@ -1677,9 +1888,27 @@ class SDMoverApp(ctk.CTk):
             self.dest_mode_var.get(), base, self.folder_name_entry.get(),
         )
 
+        # respect copy_selection dropdown
+        try:
+            sel_mode = self.copy_selection_var.get() if hasattr(self, "copy_selection_var") else "all"
+        except Exception:
+            sel_mode = "all"
+        sel_mode = "selected" if "Selected" in str(sel_mode) else "all"
+        files_for_confirm = self.scanned_files
+        if sel_mode == "selected":
+            try:
+                sel = set(getattr(self.preview, "_selected", set()))
+                if sel:
+                    files_for_confirm = [p for p in self.scanned_files if str(p) in sel]
+                else:
+                    messagebox.showwarning("No Selection", "No files selected. Select files in the preview or switch to 'All files'.")
+                    return
+            except Exception:
+                pass
+
         confirm = messagebox.askyesno(
             "Confirm Copy",
-            f"Copy {len(self.scanned_files)} files to:\n{dest}\n\nContinue?",
+            f"Copy {len(files_for_confirm)} files to:\n{dest}\n\nContinue?",
         )
         if not confirm:
             return
@@ -1695,38 +1924,149 @@ class SDMoverApp(ctk.CTk):
 
         threading.Thread(target=self._copy_thread, args=(dest,), daemon=True).start()
 
+    def _copy_selected(self):
+        if not self.scanned_files or self.copying:
+            return
+        try:
+            sel = set(getattr(self.preview, "_selected", set()))
+            if not sel:
+                messagebox.showwarning("No Selection", "No files selected. Use checkboxes on previews or Select All.")
+                return
+            selected = [p for p in self.scanned_files if str(p) in sel]
+            if not selected:
+                messagebox.showwarning("No Selection", "Selected files not found in scan.")
+                return
+        except Exception as e:
+            messagebox.showwarning("Error", str(e))
+            return
+        base = self.base_folder_var.get()
+        if not Path(base).is_dir():
+            messagebox.showwarning("Invalid Folder", "The base destination folder does not exist.")
+            return
+        dest = get_destination(self.dest_mode_var.get(), base, self.folder_name_entry.get())
+        confirm = messagebox.askyesno("Confirm Copy", f"Copy {len(selected)} selected files to:\n{dest}\n\nContinue?")
+        if not confirm:
+            return
+        ensure_folder(dest)
+        self.copying = True
+        self.copy_btn.configure(state="disabled", text="Copying...")
+        self.scan_btn.configure(state="disabled")
+        self.progress_bar.set(0)
+        self.progress_pct.configure(text="0%")
+        self.progress_label.configure(text="Starting...")
+        self.footer.configure(text="Copying selected files...")
+        # _copy_thread will handle selection via copy_selection, but for this button we force selected
+        # Temporarily override the selection set to ensure _copy_thread sees it
+        threading.Thread(target=self._copy_thread_selected, args=(dest, selected), daemon=True).start()
+
+    def _copy_thread_selected(self, dest, selected_files):
+        def progress_cb(current, total, filename):
+            self.after(0, self._update_progress, current, total, filename)
+        rating_mode = self.rating_mode_var.get() if hasattr(self, "rating_mode_var") else "metadata"
+        try:
+            rating_thr = int(self.rating_threshold_var.get()) if hasattr(self, "rating_threshold_var") else 1
+        except Exception:
+            rating_thr = 1
+        verify = bool(self.verify_var.get()) if hasattr(self, "verify_var") else False
+        ratings = getattr(self.preview, "_ratings", {})
+        def _rating_of(p): return ratings.get(str(p), 0)
+        rated_dir = dest / "rated"
+        needs_rated = rating_mode in ("folder", "both") and any(_rating_of(p) >= rating_thr for p in selected_files)
+        if needs_rated:
+            try: ensure_folder(rated_dir)
+            except Exception: pass
+        total = len(selected_files)
+        success = failed = 0
+        failed_files = []
+        for i, src in enumerate(selected_files, 1):
+            try:
+                if progress_cb: progress_cb(i, total, src.name)
+                r = _rating_of(src)
+                dst = copy_file(src, rated_dir if rating_mode in ("folder","both") and r >= rating_thr else dest)
+                if verify:
+                    from .file_scanner import compute_file_hash
+                    if compute_file_hash(src) != compute_file_hash(dst):
+                        try: dst.unlink(missing_ok=True)
+                        except Exception: pass
+                        raise OSError("hash mismatch")
+                if rating_mode in ("metadata","both") and r>0:
+                    try: write_rating(dst, r)
+                    except Exception: pass
+                success+=1
+            except Exception as e:
+                failed+=1; failed_files.append((src,str(e)))
+        self.after(0, self._copy_done, dest, success, failed, failed_files)
+
     def _copy_thread(self, dest):
         def progress_cb(current, total, filename):
             self.after(0, self._update_progress, current, total, filename)
 
         rating_mode = self.rating_mode_var.get() if hasattr(self, "rating_mode_var") else "metadata"
+        try:
+            rating_thr = int(self.rating_threshold_var.get()) if hasattr(self, "rating_threshold_var") else 1
+        except Exception:
+            rating_thr = 1
+        verify = bool(self.verify_var.get()) if hasattr(self, "verify_var") else False
+        # copy selection: dropdown "Selected only" vs "All"
+        try:
+            sel_mode = self.copy_selection_var.get() if hasattr(self, "copy_selection_var") else "all"
+        except Exception:
+            sel_mode = "all"
+        sel_mode = "selected" if "Selected" in str(sel_mode) else "all"
         ratings = getattr(self.preview, "_ratings", {})
+        # selected set from preview
+        try:
+            selected = set(getattr(self.preview, "_selected", set()))
+        except Exception:
+            selected = set()
 
         def _rating_of(p):
             return ratings.get(str(p), 0)
 
-        # folder mode: rated files go to dest/rated/
+        # decide which files to copy
+        if sel_mode == "selected" and selected:
+            files_to_copy = [p for p in self.scanned_files if str(p) in selected]
+        else:
+            files_to_copy = list(self.scanned_files)
+
+        # folder mode: rated files go to dest/rated/ when rating >= threshold
         rated_dir = dest / "rated"
-        needs_rated = rating_mode in ("folder", "both") and any(_rating_of(p) > 0 for p in self.scanned_files)
+        needs_rated = rating_mode in ("folder", "both") and any(_rating_of(p) >= rating_thr for p in files_to_copy)
         if needs_rated:
             try:
                 ensure_folder(rated_dir)
             except Exception:
                 pass
 
-        total = len(self.scanned_files)
+        total = len(files_to_copy)
+        if total == 0:
+            self.after(0, self._copy_done, dest, 0, 0, [])
+            return
         success = 0
         failed = 0
         failed_files = []
-        for i, src in enumerate(self.scanned_files, 1):
+        for i, src in enumerate(files_to_copy, 1):
             try:
                 if progress_cb:
                     progress_cb(i, total, src.name)
                 r = _rating_of(src)
-                if rating_mode in ("folder", "both") and r > 0:
+                if rating_mode in ("folder", "both") and r >= rating_thr:
                     dst = copy_file(src, rated_dir)
                 else:
                     dst = copy_file(src, dest)
+                if verify:
+                    try:
+                        from .file_scanner import compute_file_hash
+                        if compute_file_hash(src) != compute_file_hash(dst):
+                            try:
+                                dst.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                            raise OSError("hash mismatch")
+                    except OSError:
+                        raise
+                    except Exception as ve:
+                        raise OSError(f"verify failed: {ve}")
                 if rating_mode in ("metadata", "both") and r > 0:
                     try:
                         write_rating(dst, r)
@@ -1797,6 +2137,28 @@ class SDMoverApp(ctk.CTk):
         self.dest_mode_var.set(saved.get("default_dest_mode", "date"))
         self._toggle_dest_name()
         self.rating_mode_var.set(saved.get("rating_mode", "metadata"))
+        # New settings — dropdown, slider, toggle, thumb size
+        cs = saved.get("copy_selection", "all")
+        self.copy_selection_var.set("Selected only" if cs == "selected" else "All files")
+        thr = int(saved.get("rating_threshold", 1))
+        thr = max(1, min(5, thr))
+        self.rating_threshold_var.set(thr)
+        try:
+            self.rating_threshold_slider.set(thr)
+            self.rating_threshold_label.configure(text=f"≥{thr} ★")
+        except Exception:
+            pass
+        self.verify_var.set(bool(saved.get("verify_after_copy", False)))
+        ts = saved.get("thumb_size", "auto")
+        disp = {"auto": "Auto", "S": "Small", "M": "Medium", "L": "Large",
+                "small": "Small", "medium": "Medium", "large": "Large"}.get(str(ts), "Auto")
+        self.thumb_size_var.set(disp)
+        # Apply thumb size immediately for next scan
+        size_map = {"S": (90, 68), "M": (120, 90), "L": (150, 113)}
+        key = str(ts).upper() if isinstance(ts, str) else ""
+        if key in size_map:
+            import sd_mover.gui as _g
+            _g.THUMB_SIZE = size_map[key]
 
         # Apply theme
         theme = saved.get("theme", "system")
