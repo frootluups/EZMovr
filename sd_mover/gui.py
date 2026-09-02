@@ -1220,6 +1220,28 @@ class SDMoverApp(ctk.CTk):
         self.geometry("1050x700")
         self.minsize(900, 600)
 
+        # App icon (window + taskbar)
+        try:
+            import sys as _sys
+            base = Path(getattr(_sys, "_MEIPASS", Path(__file__).parent.parent))
+            ico = base / "assets" / "icon.ico"
+            png = base / "assets" / "icon.png"
+            if ico.exists():
+                try:
+                    self.iconbitmap(str(ico))
+                except Exception:
+                    pass
+                try:
+                    from PIL import Image as _PILImage, ImageTk
+                    im = _PILImage.open(str(png if png.exists() else ico))
+                    im = im.resize((64, 64), _PILImage.LANCZOS)
+                    self._icon_img = ImageTk.PhotoImage(im)
+                    self.wm_iconphoto(True, self._icon_img)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         ctk.set_default_color_theme("blue")
 
         self.drives = []
